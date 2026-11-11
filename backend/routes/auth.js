@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
-const db = require('../config/database');
+const User = require('../models/User');
 const { generateToken } = require('../utils/jwt');
 const { authenticateToken } = require('../middleware/auth');
 
@@ -24,37 +24,40 @@ router.post('/register', async (req, res) => {
         }
 
         // Check if user already exists
-        const [existingUsers] = await db.query(
-            'SELECT id FROM users WHERE email = ?',
-            [email]
-        );
-
-        if (existingUsers.length > 0) {
+        const existingUser = await User.findOne({ email });
+        if (existingUser) {
             return res.status(400).json({ error: 'Email already registered' });
         }
 
         // Hash password
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        // Insert user
-        const [result] = await db.query(
-            'INSERT INTO users (name, email, phone, password, role, status) VALUES (?, ?, ?, ?, ?, ?)',
-            [name, email, phone || null, hashedPassword, 'user', 'active']
-        );
+        // Create user
+        const user = await User.create({
+            name,
+            email,
+            phone: phone || null,
+            password: hashedPassword,
+            role: 'user',
+            status: 'active'
+        });
 
         // Generate token
-        const user = { id: result.insertId, email, role: 'user' };
-        const token = generateToken(user);
+        const token = generateToken({
+            id: user._id,
+            email: user.email,
+            role: user.role
+        });
 
         res.status(201).json({
             message: 'Registration successful',
             token,
             user: {
-                id: result.insertId,
-                name,
-                email,
-                phone,
-                role: 'user'
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                phone: user.phone,
+                role: user.role
             }
         });
     } catch (error) {
@@ -74,16 +77,10 @@ router.post('/login', async (req, res) => {
         }
 
         // Find user
-        const [users] = await db.query(
-            'SELECT * FROM users WHERE email = ? AND status = ?',
-            [email, 'active']
-        );
-
-        if (users.length === 0) {
+        const user = await User.findOne({ email, status: 'active' });
+        if (!user) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
-
-        const user = users[0];
 
         // Verify password
         const validPassword = await bcrypt.compare(password, user.password);
@@ -93,7 +90,7 @@ router.post('/login', async (req, res) => {
 
         // Generate token
         const token = generateToken({
-            id: user.id,
+            id: user._id,
             email: user.email,
             role: user.role
         });
@@ -102,7 +99,7 @@ router.post('/login', async (req, res) => {
             message: 'Login successful',
             token,
             user: {
-                id: user.id,
+                id: user._id,
                 name: user.name,
                 email: user.email,
                 phone: user.phone,
@@ -118,16 +115,12 @@ router.post('/login', async (req, res) => {
 // Get current user
 router.get('/me', authenticateToken, async (req, res) => {
     try {
-        const [users] = await db.query(
-            'SELECT id, name, email, phone, role, status, created_at FROM users WHERE id = ?',
-            [req.user.id]
-        );
-
-        if (users.length === 0) {
+        const user = await User.findById(req.user.id).select('-password');
+        if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
 
-        res.json({ user: users[0] });
+        res.json({ user });
     } catch (error) {
         console.error('Get user error:', error);
         res.status(500).json({ error: 'Failed to fetch user' });
@@ -141,23 +134,19 @@ router.put('/profile', authenticateToken, async (req, res) => {
         const userId = req.user.id;
 
         // Get current user
-        const [users] = await db.query('SELECT * FROM users WHERE id = ?', [userId]);
-        if (users.length === 0) {
+        const user = await User.findById(userId);
+        if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
 
-        const user = users[0];
-        let updateFields = [];
-        let updateValues = [];
+        const updateData = {};
 
         // Update name and phone
         if (name) {
-            updateFields.push('name = ?');
-            updateValues.push(name);
+            updateData.name = name;
         }
         if (phone !== undefined) {
-            updateFields.push('phone = ?');
-            updateValues.push(phone);
+            updateData.phone = phone;
         }
 
         // Update password if provided
@@ -171,31 +160,23 @@ router.put('/profile', authenticateToken, async (req, res) => {
                 return res.status(401).json({ error: 'Current password is incorrect' });
             }
 
-            const hashedPassword = await bcrypt.hash(newPassword, 10);
-            updateFields.push('password = ?');
-            updateValues.push(hashedPassword);
+            updateData.password = await bcrypt.hash(newPassword, 10);
         }
 
-        if (updateFields.length === 0) {
+        if (Object.keys(updateData).length === 0) {
             return res.status(400).json({ error: 'No fields to update' });
         }
 
-        updateValues.push(userId);
-
-        await db.query(
-            `UPDATE users SET ${updateFields.join(', ')} WHERE id = ?`,
-            updateValues
-        );
-
-        // Return updated user
-        const [updatedUsers] = await db.query(
-            'SELECT id, name, email, phone, role, status FROM users WHERE id = ?',
-            [userId]
-        );
+        // Update user
+        const updatedUser = await User.findByIdAndUpdate(
+            userId,
+            updateData,
+            { new: true }
+        ).select('-password');
 
         res.json({
             message: 'Profile updated successfully',
-            user: updatedUsers[0]
+            user: updatedUser
         });
     } catch (error) {
         console.error('Update profile error:', error);

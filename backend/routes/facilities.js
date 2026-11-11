@@ -1,43 +1,50 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const Facility = require('../models/Facility');
+const Review = require('../models/Review');
+const TimeSlot = require('../models/TimeSlot');
 const { authenticateToken } = require('../middleware/auth');
 
 // Get all facilities with optional filters
 router.get('/', async (req, res) => {
     try {
         const { sport_type, location, search } = req.query;
-        
-        let query = `
-            SELECT f.*, 
-                   COALESCE(AVG(r.rating), 0) as avg_rating,
-                   COUNT(r.id) as review_count
-            FROM facilities f
-            LEFT JOIN reviews r ON f.id = r.facility_id
-            WHERE f.status = 'active'
-        `;
-        
-        const params = [];
+
+        let query = { status: 'active' };
 
         if (sport_type) {
-            query += ' AND f.sport_type = ?';
-            params.push(sport_type);
+            query.sport_type = sport_type;
         }
 
         if (location) {
-            query += ' AND f.location LIKE ?';
-            params.push(`%${location}%`);
+            query.location = { $regex: location, $options: 'i' };
         }
 
         if (search) {
-            query += ' AND (f.name LIKE ? OR f.description LIKE ?)';
-            params.push(`%${search}%`, `%${search}%`);
+            query.$or = [
+                { name: { $regex: search, $options: 'i' } },
+                { description: { $regex: search, $options: 'i' } }
+            ];
         }
 
-        query += ' GROUP BY f.id ORDER BY f.created_at DESC';
+        const facilities = await Facility.find(query).sort({ createdAt: -1 });
 
-        const [facilities] = await db.query(query, params);
-        res.json({ facilities });
+        // Add rating and review count for each facility
+        const facilitiesWithStats = await Promise.all(
+            facilities.map(async (facility) => {
+                const reviews = await Review.find({ facility_id: facility._id });
+                const avgRating = reviews.length > 0
+                    ? reviews.reduce((sum, r) => sum + r.rating, 0) / reviews.length
+                    : 0;
+                return {
+                    ...facility.toObject(),
+                    avg_rating: avgRating,
+                    review_count: reviews.length
+                };
+            })
+        );
+
+        res.json({ facilities: facilitiesWithStats });
     } catch (error) {
         console.error('Get facilities error:', error);
         res.status(500).json({ error: 'Failed to fetch facilities' });
@@ -49,33 +56,29 @@ router.get('/:id', async (req, res) => {
     try {
         const { id } = req.params;
 
-        const [facilities] = await db.query(
-            `SELECT f.*, 
-                    COALESCE(AVG(r.rating), 0) as avg_rating,
-                    COUNT(r.id) as review_count
-             FROM facilities f
-             LEFT JOIN reviews r ON f.id = r.facility_id
-             WHERE f.id = ? AND f.status = 'active'
-             GROUP BY f.id`,
-            [id]
-        );
-
-        if (facilities.length === 0) {
+        const facility = await Facility.findOne({ _id: id, status: 'active' });
+        if (!facility) {
             return res.status(404).json({ error: 'Facility not found' });
         }
 
-        // Get reviews for this facility
-        const [reviews] = await db.query(
-            `SELECT r.*, u.name as user_name
-             FROM reviews r
-             JOIN users u ON r.user_id = u.id
-             WHERE r.facility_id = ?
-             ORDER BY r.created_at DESC`,
-            [id]
-        );
+        // Get reviews for this facility with user names
+        const reviews = await Review.find({ facility_id: id })
+            .populate('user_id', 'name')
+            .sort({ createdAt: -1 });
+
+        // Calculate average rating
+        const avgRating = reviews.length > 0
+            ? reviews.reduce((sum, r) => sum + r.rating, 0) / reviews.length
+            : 0;
+
+        const facilityWithStats = {
+            ...facility.toObject(),
+            avg_rating: avgRating,
+            review_count: reviews.length
+        };
 
         res.json({
-            facility: facilities[0],
+            facility: facilityWithStats,
             reviews
         });
     } catch (error) {
@@ -94,13 +97,10 @@ router.get('/:id/availability', async (req, res) => {
             return res.status(400).json({ error: 'Date parameter is required' });
         }
 
-        const [slots] = await db.query(
-            `SELECT id, date, start_time, end_time, status
-             FROM time_slots
-             WHERE facility_id = ? AND date = ?
-             ORDER BY start_time`,
-            [id, date]
-        );
+        const slots = await TimeSlot.find({
+            facility_id: id,
+            date: new Date(date)
+        }).sort({ start_time: 1 });
 
         res.json({ slots });
     } catch (error) {
@@ -122,30 +122,24 @@ router.post('/:id/reviews', authenticateToken, async (req, res) => {
         }
 
         // Check if facility exists
-        const [facilities] = await db.query(
-            'SELECT id FROM facilities WHERE id = ?',
-            [id]
-        );
-
-        if (facilities.length === 0) {
+        const facility = await Facility.findById(id);
+        if (!facility) {
             return res.status(404).json({ error: 'Facility not found' });
         }
 
         // Check if user already reviewed
-        const [existingReviews] = await db.query(
-            'SELECT id FROM reviews WHERE user_id = ? AND facility_id = ?',
-            [userId, id]
-        );
-
-        if (existingReviews.length > 0) {
+        const existingReview = await Review.findOne({ user_id: userId, facility_id: id });
+        if (existingReview) {
             return res.status(400).json({ error: 'You have already reviewed this facility' });
         }
 
-        // Insert review
-        await db.query(
-            'INSERT INTO reviews (user_id, facility_id, rating, comment) VALUES (?, ?, ?, ?)',
-            [userId, id, rating, comment || null]
-        );
+        // Create review
+        await Review.create({
+            user_id: userId,
+            facility_id: id,
+            rating,
+            comment: comment || null
+        });
 
         res.status(201).json({ message: 'Review added successfully' });
     } catch (error) {

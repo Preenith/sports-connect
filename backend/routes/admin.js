@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const User = require('../models/User');
+const Facility = require('../models/Facility');
+const TimeSlot = require('../models/TimeSlot');
+const Booking = require('../models/Booking');
 const { authenticateToken, requireAdmin } = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
@@ -41,54 +44,82 @@ const upload = multer({
 router.get('/stats', authenticateToken, requireAdmin, async (req, res) => {
     try {
         // Total users
-        const [userCount] = await db.query('SELECT COUNT(*) as count FROM users');
+        const userCount = await User.countDocuments();
         
         // Total facilities
-        const [facilityCount] = await db.query('SELECT COUNT(*) as count FROM facilities WHERE status = "active"');
+        const facilityCount = await Facility.countDocuments({ status: 'active' });
         
         // Today's bookings
-        const [todayBookings] = await db.query(
-            'SELECT COUNT(*) as count FROM bookings WHERE DATE(created_at) = CURDATE()'
-        );
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const todayBookings = await Booking.countDocuments({
+            createdAt: { $gte: today }
+        });
         
         // Upcoming bookings
-        const [upcomingBookings] = await db.query(
-            'SELECT COUNT(*) as count FROM bookings WHERE booking_date >= CURDATE() AND booking_status = "confirmed"'
-        );
+        const upcomingBookings = await Booking.countDocuments({
+            booking_date: { $gte: new Date() },
+            booking_status: 'confirmed'
+        });
         
         // Total revenue
-        const [revenue] = await db.query(
-            'SELECT SUM(amount) as total FROM bookings WHERE booking_status = "confirmed" AND payment_status = "paid"'
-        );
+        const revenueResult = await Booking.aggregate([
+            { $match: { booking_status: 'confirmed', payment_status: 'paid' } },
+            { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]);
+        const totalRevenue = revenueResult.length > 0 ? revenueResult[0].total : 0;
         
         // Most booked sport
-        const [sportStats] = await db.query(
-            `SELECT f.sport_type, COUNT(*) as count
-             FROM bookings b
-             JOIN facilities f ON b.facility_id = f.id
-             GROUP BY f.sport_type
-             ORDER BY count DESC
-             LIMIT 1`
-        );
+        const sportStats = await Booking.aggregate([
+            {
+                $lookup: {
+                    from: 'facilities',
+                    localField: 'facility_id',
+                    foreignField: '_id',
+                    as: 'facility'
+                }
+            },
+            { $unwind: '$facility' },
+            {
+                $group: {
+                    _id: '$facility.sport_type',
+                    count: { $sum: 1 }
+                }
+            },
+            { $sort: { count: -1 } },
+            { $limit: 1 }
+        ]);
         
         // Facility usage statistics
-        const [facilityUsage] = await db.query(
-            `SELECT f.name, COUNT(b.id) as booking_count
-             FROM facilities f
-             LEFT JOIN bookings b ON f.id = b.facility_id
-             GROUP BY f.id
-             ORDER BY booking_count DESC
-             LIMIT 5`
-        );
+        const facilityUsage = await Booking.aggregate([
+            {
+                $lookup: {
+                    from: 'facilities',
+                    localField: 'facility_id',
+                    foreignField: '_id',
+                    as: 'facility'
+                }
+            },
+            { $unwind: '$facility' },
+            {
+                $group: {
+                    _id: '$facility._id',
+                    name: { $first: '$facility.name' },
+                    booking_count: { $sum: 1 }
+                }
+            },
+            { $sort: { booking_count: -1 } },
+            { $limit: 5 }
+        ]);
 
         res.json({
             stats: {
-                total_users: userCount[0].count,
-                total_facilities: facilityCount[0].count,
-                today_bookings: todayBookings[0].count,
-                upcoming_bookings: upcomingBookings[0].count,
-                total_revenue: revenue[0].total || 0,
-                most_booked_sport: sportStats.length > 0 ? sportStats[0].sport_type : 'N/A',
+                total_users: userCount,
+                total_facilities: facilityCount,
+                today_bookings: todayBookings,
+                upcoming_bookings: upcomingBookings,
+                total_revenue: totalRevenue,
+                most_booked_sport: sportStats.length > 0 ? sportStats[0]._id : 'N/A',
                 facility_usage: facilityUsage
             }
         });
@@ -115,14 +146,19 @@ router.post('/facilities', authenticateToken, requireAdmin, upload.single('image
             return res.status(400).json({ error: 'Name, sport type, location, and price are required' });
         }
 
-        const [result] = await db.query(
-            'INSERT INTO facilities (name, sport_type, location, description, price_per_hour, image, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [name, sport_type, location, description || null, price_per_hour, imagePath, 'active']
-        );
+        const facility = await Facility.create({
+            name,
+            sport_type,
+            location,
+            description: description || null,
+            price_per_hour,
+            image: imagePath,
+            status: 'active'
+        });
 
         res.status(201).json({
             message: 'Facility added successfully',
-            facility_id: result.insertId
+            facility_id: facility._id
         });
     } catch (error) {
         console.error('Add facility error:', error);
@@ -136,12 +172,13 @@ router.put('/facilities/:id', authenticateToken, requireAdmin, async (req, res) 
         const { id } = req.params;
         const { name, sport_type, location, description, price_per_hour, image, status } = req.body;
 
-        const [result] = await db.query(
-            'UPDATE facilities SET name = ?, sport_type = ?, location = ?, description = ?, price_per_hour = ?, image = ?, status = ? WHERE id = ?',
-            [name, sport_type, location, description, price_per_hour, image, status, id]
+        const facility = await Facility.findByIdAndUpdate(
+            id,
+            { name, sport_type, location, description, price_per_hour, image, status },
+            { new: true }
         );
 
-        if (result.affectedRows === 0) {
+        if (!facility) {
             return res.status(404).json({ error: 'Facility not found' });
         }
 
@@ -157,9 +194,9 @@ router.delete('/facilities/:id', authenticateToken, requireAdmin, async (req, re
     try {
         const { id } = req.params;
 
-        const [result] = await db.query('DELETE FROM facilities WHERE id = ?', [id]);
+        const facility = await Facility.findByIdAndDelete(id);
 
-        if (result.affectedRows === 0) {
+        if (!facility) {
             return res.status(404).json({ error: 'Facility not found' });
         }
 
@@ -181,14 +218,17 @@ router.post('/slots', authenticateToken, requireAdmin, async (req, res) => {
             return res.status(400).json({ error: 'All fields are required' });
         }
 
-        const [result] = await db.query(
-            'INSERT INTO time_slots (facility_id, date, start_time, end_time, status) VALUES (?, ?, ?, ?, ?)',
-            [facility_id, date, start_time, end_time, 'available']
-        );
+        const slot = await TimeSlot.create({
+            facility_id,
+            date: new Date(date),
+            start_time,
+            end_time,
+            status: 'available'
+        });
 
         res.status(201).json({
             message: 'Time slot added successfully',
-            slot_id: result.insertId
+            slot_id: slot._id
         });
     } catch (error) {
         console.error('Add slot error:', error);
@@ -206,12 +246,13 @@ router.put('/slots/:id', authenticateToken, requireAdmin, async (req, res) => {
             return res.status(400).json({ error: 'Invalid status' });
         }
 
-        const [result] = await db.query(
-            'UPDATE time_slots SET status = ? WHERE id = ?',
-            [status, id]
+        const slot = await TimeSlot.findByIdAndUpdate(
+            id,
+            { status },
+            { new: true }
         );
 
-        if (result.affectedRows === 0) {
+        if (!slot) {
             return res.status(404).json({ error: 'Time slot not found' });
         }
 
@@ -227,28 +268,20 @@ router.get('/slots/daily', authenticateToken, requireAdmin, async (req, res) => 
     try {
         const { date, facility_id } = req.query;
 
-        let query = `
-            SELECT ts.*, f.name as facility_name
-            FROM time_slots ts
-            JOIN facilities f ON ts.facility_id = f.id
-            WHERE 1=1
-        `;
-        
-        const params = [];
+        let query = {};
 
         if (date) {
-            query += ' AND ts.date = ?';
-            params.push(date);
+            query.date = new Date(date);
         }
 
         if (facility_id) {
-            query += ' AND ts.facility_id = ?';
-            params.push(facility_id);
+            query.facility_id = facility_id;
         }
 
-        query += ' ORDER BY ts.date, ts.start_time';
+        const slots = await TimeSlot.find(query)
+            .populate('facility_id', 'name')
+            .sort({ date: 1, start_time: 1 });
 
-        const [slots] = await db.query(query, params);
         res.json({ slots });
     } catch (error) {
         console.error('Get daily schedule error:', error);
@@ -263,40 +296,43 @@ router.get('/bookings', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { date, facility_id, status, search } = req.query;
 
-        let query = `
-            SELECT b.*, u.name as user_name, u.email as user_email, f.name as facility_name
-            FROM bookings b
-            JOIN users u ON b.user_id = u.id
-            JOIN facilities f ON b.facility_id = f.id
-            WHERE 1=1
-        `;
-        
-        const params = [];
+        let query = {};
 
         if (date) {
-            query += ' AND b.booking_date = ?';
-            params.push(date);
+            query.booking_date = new Date(date);
         }
 
         if (facility_id) {
-            query += ' AND b.facility_id = ?';
-            params.push(facility_id);
+            query.facility_id = facility_id;
         }
 
         if (status) {
-            query += ' AND b.booking_status = ?';
-            params.push(status);
+            query.booking_status = status;
         }
 
         if (search) {
-            query += ' AND (b.booking_id LIKE ? OR u.name LIKE ? OR u.email LIKE ?)';
-            params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+            query.$or = [
+                { booking_id: { $regex: search, $options: 'i' } }
+            ];
         }
 
-        query += ' ORDER BY b.created_at DESC';
+        const bookings = await Booking.find(query)
+            .populate('user_id', 'name email')
+            .populate('facility_id', 'name')
+            .sort({ createdAt: -1 });
 
-        const [bookings] = await db.query(query, params);
-        res.json({ bookings });
+        // Filter by user name/email if search is provided
+        let filteredBookings = bookings;
+        if (search) {
+            filteredBookings = bookings.filter(booking => {
+                const userName = booking.user_id?.name || '';
+                const userEmail = booking.user_id?.email || '';
+                return userName.toLowerCase().includes(search.toLowerCase()) ||
+                       userEmail.toLowerCase().includes(search.toLowerCase());
+            });
+        }
+
+        res.json({ bookings: filteredBookings });
     } catch (error) {
         console.error('Get bookings error:', error);
         res.status(500).json({ error: 'Failed to fetch bookings' });
@@ -305,47 +341,44 @@ router.get('/bookings', authenticateToken, requireAdmin, async (req, res) => {
 
 // Cancel booking (admin)
 router.put('/bookings/:id/cancel', authenticateToken, requireAdmin, async (req, res) => {
-    const connection = await db.getConnection();
+    const session = await Booking.startSession();
     
     try {
-        await connection.beginTransaction();
+        await session.startTransaction();
         
         const { id } = req.params;
 
-        // Get booking
-        const [bookings] = await connection.query(
-            'SELECT * FROM bookings WHERE id = ? FOR UPDATE',
-            [id]
-        );
+        // Get booking with lock
+        const booking = await Booking.findById(id).session(session);
 
-        if (bookings.length === 0) {
-            await connection.rollback();
+        if (!booking) {
+            await session.abortTransaction();
             return res.status(404).json({ error: 'Booking not found' });
         }
 
-        const booking = bookings[0];
-
         // Update booking status
-        await connection.query(
-            'UPDATE bookings SET booking_status = ?, payment_status = ? WHERE id = ?',
-            ['cancelled', 'refunded', id]
+        await Booking.findByIdAndUpdate(
+            id,
+            { booking_status: 'cancelled', payment_status: 'refunded' },
+            { session }
         );
 
         // Make slot available again
-        await connection.query(
-            'UPDATE time_slots SET status = ? WHERE id = ?',
-            ['available', booking.slot_id]
+        await TimeSlot.findByIdAndUpdate(
+            booking.slot_id,
+            { status: 'available' },
+            { session }
         );
 
-        await connection.commit();
+        await session.commitTransaction();
 
         res.json({ message: 'Booking cancelled successfully' });
     } catch (error) {
-        await connection.rollback();
+        await session.abortTransaction();
         console.error('Cancel booking error:', error);
         res.status(500).json({ error: 'Failed to cancel booking' });
     } finally {
-        connection.release();
+        session.endSession();
     }
 });
 
@@ -356,22 +389,20 @@ router.get('/users', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { search, status } = req.query;
 
-        let query = 'SELECT id, name, email, phone, role, status, created_at FROM users WHERE 1=1';
-        const params = [];
+        let query = {};
 
         if (search) {
-            query += ' AND (name LIKE ? OR email LIKE ?)';
-            params.push(`%${search}%`, `%${search}%`);
+            query.$or = [
+                { name: { $regex: search, $options: 'i' } },
+                { email: { $regex: search, $options: 'i' } }
+            ];
         }
 
         if (status) {
-            query += ' AND status = ?';
-            params.push(status);
+            query.status = status;
         }
 
-        query += ' ORDER BY created_at DESC';
-
-        const [users] = await db.query(query, params);
+        const users = await User.find(query).select('-password').sort({ createdAt: -1 });
         res.json({ users });
     } catch (error) {
         console.error('Get users error:', error);
@@ -389,12 +420,13 @@ router.put('/users/:id/status', authenticateToken, requireAdmin, async (req, res
             return res.status(400).json({ error: 'Invalid status' });
         }
 
-        const [result] = await db.query(
-            'UPDATE users SET status = ? WHERE id = ?',
-            [status, id]
+        const user = await User.findByIdAndUpdate(
+            id,
+            { status },
+            { new: true }
         );
 
-        if (result.affectedRows === 0) {
+        if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
 

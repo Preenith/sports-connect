@@ -3,6 +3,7 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const path = require('path');
 require('dotenv').config();
+const { connectDB } = require('./config/database');
 
 const app = express();
 
@@ -67,7 +68,14 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`http://localhost:${PORT}`);
+
+// Connect to MongoDB and start server
+connectDB().then(() => {
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+        console.log(`http://localhost:${PORT}`);
+    });
+}).catch(error => {
+    console.error('Failed to start server:', error);
+    process.exit(1);
 });
