@@ -8,7 +8,12 @@ const { connectDB } = require('./config/database');
 const app = express();
 
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: process.env.NODE_ENV === 'production' 
+        ? ['https://sports-booking-frontend.vercel.app', 'https://sports-booking-frontend.onrender.com']
+        : ['http://localhost:3000', 'http://127.0.0.1:3000'],
+    credentials: true
+}));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 

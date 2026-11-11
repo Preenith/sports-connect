@@ -61,6 +61,7 @@
     </footer>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="js/config.js"></script>
     <script src="js/auth.js"></script>
     <script>
         window.onload = function() {
@@ -90,7 +91,7 @@
             }
 
             // Get facility details
-            fetch(`/api/facilities/${facilityId}`)
+            fetch(`${API_BASE_URL}/facilities/${facilityId}`)
                 .then(response => response.json())
                 .then(data => {
                     displayBookingSummary(data.facility, slotId, date, startTime, endTime, amount);
@@ -182,7 +183,7 @@
                 return;
             }
 
-            fetch('/api/bookings', {
+            fetch(`${API_BASE_URL}/bookings', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
